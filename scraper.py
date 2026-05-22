@@ -2,6 +2,8 @@ import csv
 import random
 import re
 import asyncio
+import os
+import platform
 from playwright.async_api import async_playwright
 
 def load_asins_from_csv(filename="input.csv"):
@@ -18,6 +20,34 @@ def load_asins_from_csv(filename="input.csv"):
     except FileNotFoundError:
         print(f"Error: {filename} not found. Please create {filename} with your ASINs.")
     return asins
+
+def get_chrome_executable_path():
+    system = platform.system()
+    if system == "Darwin":  # macOS
+        mac_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+        if os.path.exists(mac_path):
+            return mac_path
+    elif system == "Windows":
+        # Check standard Windows installation paths
+        win_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
+        ]
+        for path in win_paths:
+            if os.path.exists(path):
+                return path
+    elif system == "Linux":
+        linux_paths = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium"
+        ]
+        for path in linux_paths:
+            if os.path.exists(path):
+                return path
+    return None
 
 TARGET_SELLER = "Bargad Healthcare"
 
@@ -123,10 +153,14 @@ async def scrape_amazon_async(asins):
     
     print("Starting Playwright to scrape Amazon...")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            executable_path='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-        )
+        exec_path = get_chrome_executable_path()
+        launch_kwargs = {"headless": False}
+        if exec_path:
+            launch_kwargs["executable_path"] = exec_path
+        else:
+            print("Google Chrome not found in standard paths. Falling back to Playwright's default browser...")
+            
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={'width': 1280, 'height': 800}
