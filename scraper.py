@@ -3,8 +3,56 @@ import random
 import re
 import asyncio
 import os
-import platform
+import smtplib
+import ssl
+from email.message import EmailMessage
 from playwright.async_api import async_playwright
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SENDER_EMAIL = os.getenv("SENDER_EMAIL") or os.getenv("SMTP_USERNAME")
+SENDER_PASSWORD = os.getenv("SENDER_PASSWORD") or os.getenv("SMTP_PASSWORD")
+if SENDER_PASSWORD:
+    SENDER_PASSWORD = SENDER_PASSWORD.replace('"', '').replace("'", "").replace(" ", "")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL") or os.getenv("RECEIVER_EMAIL")
+
+def send_email_notification(asin, seller, fetched_price, adjusted_price):
+    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
+        print(f"[{asin}] Skipping email notification - missing credentials in .env file.")
+        return
+
+    recipient_list = [email.strip() for email in RECIPIENT_EMAIL.split(',') if email.strip()]
+
+    msg = EmailMessage()
+    msg.set_content(
+        f"Alert! Buy Box lost for ASIN: {asin}.\n\n"
+        f"Current Seller: {seller}\n"
+        f"Fetched Price: {fetched_price}\n"
+        f"Our Adjusted Price: {adjusted_price}\n\n"
+        f"Link: https://www.amazon.co.uk/dp/{asin}"
+    )
+    msg["Subject"] = f"BuyBox UK Lost - ASIN: {asin}"
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = ", ".join(recipient_list)
+
+    try:
+        context = ssl.create_default_context()
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                server.starttls(context=context)
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+        print(f"[{asin}] Email notification sent successfully to: {', '.join(recipient_list)}")
+    except Exception as e:
+        print(f"[{asin}] Failed to send email: {e}")
 
 def load_asins_from_csv(filename="input.csv"):
     asins = []
@@ -20,34 +68,6 @@ def load_asins_from_csv(filename="input.csv"):
     except FileNotFoundError:
         print(f"Error: {filename} not found. Please create {filename} with your ASINs.")
     return asins
-
-def get_chrome_executable_path():
-    system = platform.system()
-    if system == "Darwin":  # macOS
-        mac_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-        if os.path.exists(mac_path):
-            return mac_path
-    elif system == "Windows":
-        # Check standard Windows installation paths
-        win_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
-        ]
-        for path in win_paths:
-            if os.path.exists(path):
-                return path
-    elif system == "Linux":
-        linux_paths = [
-            "/usr/bin/google-chrome",
-            "/usr/bin/chrome",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium"
-        ]
-        for path in linux_paths:
-            if os.path.exists(path):
-                return path
-    return None
 
 TARGET_SELLER = "Bargad Healthcare"
 
@@ -140,6 +160,8 @@ async def scrape_asin(context, asin, results):
                 "New Price": round(new_price, 2), 
                 "Remark": "Seller is other, adjusted price"
             })
+            # Send email notification
+            await asyncio.to_thread(send_email_notification, asin, seller_text, price_val, round(new_price, 2))
             
     except Exception as e:
         print(f"[{asin}] Error during scraping: {e}")
@@ -148,17 +170,34 @@ async def scrape_asin(context, asin, results):
     finally:
         await page.close()
 
+import platform
+
 async def scrape_amazon_async(asins):
     results = []
     
     print("Starting Playwright to scrape Amazon...")
     async with async_playwright() as p:
-        exec_path = get_chrome_executable_path()
+        
+        # Auto-detect local Chrome to avoid Playwright install issues
+        executable_path = None
+        system = platform.system()
+        if system == "Darwin":
+            mac_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+            if os.path.exists(mac_path):
+                executable_path = mac_path
+        elif system == "Windows":
+            win_paths = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+            ]
+            for path in win_paths:
+                if os.path.exists(path):
+                    executable_path = path
+                    break
+        
         launch_kwargs = {"headless": False}
-        if exec_path:
-            launch_kwargs["executable_path"] = exec_path
-        else:
-            print("Google Chrome not found in standard paths. Falling back to Playwright's default browser...")
+        if executable_path:
+            launch_kwargs["executable_path"] = executable_path
             
         browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
@@ -166,63 +205,33 @@ async def scrape_amazon_async(asins):
             viewport={'width': 1280, 'height': 800}
         )
         
-        # Set default currency cookie for Amazon UK
-        await context.add_cookies([{
-            'name': 'i18n-prefs',
-            'value': 'GBP',
-            'domain': '.amazon.co.uk',
-            'path': '/'
-        }])
-        
-        # We need a setup page to set the postcode first
+        # We need a setup page to set the pincode first
         setup_page = await context.new_page()
         # Block images on setup page too
         await setup_page.route("**/*", lambda route: route.abort() if route.request.resource_type == "image" else route.continue_())
         
-        print("Setting delivery postcode to SW1A 1AA...")
+        print("Setting delivery pincode to E1 6AN...")
         try:
             await setup_page.goto("https://www.amazon.co.uk/")
             await setup_page.wait_for_timeout(3000)
             
-            # Accept cookies if banner appears
-            cookie_accept = setup_page.locator('#sp-cc-accept')
-            if await cookie_accept.count() > 0:
-                print("Accepting cookies...")
-                await cookie_accept.click()
-                await setup_page.wait_for_timeout(1000)
-            
             location_link = setup_page.locator('#nav-global-location-popover-link')
             if await location_link.count() > 0:
                 await location_link.click()
-                
-                # Wait dynamically for the postcode input to load
-                try:
-                    await setup_page.wait_for_selector('#GLUXZipUpdateInput', timeout=6000)
-                except Exception:
-                    pass
+                await setup_page.wait_for_timeout(2000)
                 
                 pincode_input = setup_page.locator('#GLUXZipUpdateInput')
                 if await pincode_input.count() > 0:
-                    await pincode_input.fill("SW1A 1AA")
+                    await pincode_input.fill("E1 6AN")
                     await setup_page.locator('#GLUXZipUpdate').click()
-                    await setup_page.wait_for_timeout(3000)
-                    
-                    # Try to click Done/Continue button if it appears
-                    done_btn = setup_page.locator('#GLUXConfirmClose, input[name="glowDoneButton"]').first
-                    if await done_btn.count() > 0:
-                        try:
-                            if await done_btn.is_visible(timeout=2000):
-                                await done_btn.click()
-                                await setup_page.wait_for_timeout(2000)
-                        except Exception:
-                            pass
+                    await setup_page.wait_for_timeout(2000)
                     
                     await setup_page.goto("https://www.amazon.co.uk/")
                     await setup_page.wait_for_timeout(2000)
-            print("Postcode setup completed.")
+            print("Pincode setup completed.")
         except Exception as e:
-            print(f"Warning: Could not set postcode automatically: {e}")
-            print("Please set the postcode manually in the browser window within the next 10 seconds.")
+            print(f"Warning: Could not set pincode automatically: {e}")
+            print("Please set the pincode manually in the browser window within the next 10 seconds.")
             await setup_page.wait_for_timeout(10000)
         finally:
             await setup_page.close()
